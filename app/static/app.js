@@ -6,8 +6,15 @@ const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
 const state = {
   project: null,
-  deliveryVerify: null,
+  deliveryVerify: null,   // 当前展示的核验结论（含 project_id 与 timeline_hash）
+  deliveryFile: null,     // 最近一次选择的回传稿：生效轴变化后用它自动重核
+  deliveryBusy: false,    // 核验请求进行中（手动上传或自动重核）
+  deliveryError: null,    // 自动重核失败原因（旧结论已作废，不再展示）
 };
+
+// 核验请求序号：每次发起核验（手动/自动）或切换、新建、删除项目时递增，
+// 迟到响应据此丢弃——页面只呈现当前项目最近一次有效上传的结果。
+let verifySeq = 0;
 
 const VERIFY_LABEL = {
   pass: "通过",
@@ -127,13 +134,106 @@ function renderGapReview(p) {
 }
 
 // ---------- 交付字幕核验 ----------
+// 结论与生效时间轴绑定：服务端在核验响应与项目详情中输出同源
+// timeline_hash（生效轴指纹）。参数重算 / 采纳 / 撤销改变生效轴后，
+// 旧结论立即作废，并用已选择的回传稿按新生效轴自动重新核验；
+// 未改变生效轴（相同参数重提交、修改被 400 拒绝、未影响生效轴的写入）
+// 时指纹不变，已展示的有效结论保留。
+
+function resetDelivery() {
+  verifySeq++;                       // 使进行中的迟到响应失效
+  state.deliveryVerify = null;
+  state.deliveryFile = null;
+  state.deliveryBusy = false;
+  state.deliveryError = null;
+  const f = $("#deliveryVerifyForm");
+  if (f) f.reset();
+}
+
+// render 前调用：已展示的结论若不再对应当前生效轴（指纹不同）则作废，
+// 手上有已选稿时自动按当前生效轴重新核验。
+function syncDeliveryVerify() {
+  const p = state.project;
+  const v = state.deliveryVerify;
+  if (!p || !v) return;
+  if (v.project_id === p.id && v.timeline_hash === p.timeline_hash) return;
+  state.deliveryVerify = null;       // 旧结论作废，不再展示
+  if (v.project_id === p.id && state.deliveryFile) {
+    runDeliveryVerify(state.deliveryFile, { auto: true });
+  }
+}
+
+async function runDeliveryVerify(file, { auto = false, attempt = 0 } = {}) {
+  if (!state.project || !file) return;
+  const pid = state.project.id;
+  const seq = ++verifySeq;
+  const backup = { v: state.deliveryVerify, f: state.deliveryFile };
+  state.deliveryFile = file;         // 记住最新已选稿，供生效轴变化后重核
+  state.deliveryVerify = null;       // 新上传取代旧结果
+  state.deliveryBusy = true;
+  state.deliveryError = null;
+  renderDeliveryVerify();
+  const fd = new FormData();
+  fd.append("delivery", file);
+  try {
+    const v = await api(`/api/projects/${pid}/verify-delivery`,
+                        { method: "POST", body: fd });
+    // 迟到响应：已有更新的上传，或已切换/删除项目 → 丢弃
+    if (seq !== verifySeq || !state.project || state.project.id !== pid) return;
+    // 请求期间生效轴又被并发改变（另一标签页改参数/采纳）：该结果基于
+    // 旧轴，不得展示；用同一稿件按当前生效轴重核（限重试，避免对端持续
+    // 写入时死循环）。
+    if (v.timeline_hash !== state.project.timeline_hash) {
+      if (attempt < 3) {
+        return runDeliveryVerify(file, { auto: true, attempt: attempt + 1 });
+      }
+      state.deliveryBusy = false;
+      state.deliveryError = "生效轴持续变化，请稍后重新上传核验";
+      renderDeliveryVerify();
+      return;
+    }
+    state.deliveryBusy = false;
+    state.deliveryVerify = v;
+    renderDeliveryVerify();
+    const s = v.summary;
+    toast(`核验完成：通过 ${s.pass} · 时间不符 ${s.time_mismatch} · ` +
+          `缺失 ${s.missing} · 新增 ${s.new} · 待确认 ${s.pending}`);
+  } catch (e) {
+    if (seq !== verifySeq || !state.project || state.project.id !== pid) return;
+    state.deliveryBusy = false;
+    if (auto) {
+      // 自动重核失败：旧结论已作废不可展示，仅提示重新上传
+      state.deliveryError = e.message;
+    } else {
+      // 手动上传失败：恢复上一份稿件；旧结论仍对应当前生效轴则保留，
+      // 已失效则由 sync 作废并用该稿件自动重核
+      state.deliveryVerify = backup.v;
+      state.deliveryFile = backup.f;
+      if (backup.v) syncDeliveryVerify();
+    }
+    renderDeliveryVerify();
+    toast(e.message, true);
+  }
+}
+
 function renderDeliveryVerify() {
   const v = state.deliveryVerify;
   const tb = $("#verifyTable tbody");
   const stats = $("#verifyStats");
+  const notice = $("#verifyNotice");
   tb.innerHTML = "";
+  stats.innerHTML = "";
+  if (state.deliveryBusy) {
+    notice.textContent = "正在按当前生效时间轴核验…";
+    notice.classList.remove("hidden");
+  } else if (state.deliveryError) {
+    notice.textContent =
+      `自动重新核验失败：${state.deliveryError}（旧结论已作废，请重新上传）`;
+    notice.classList.remove("hidden");
+  } else {
+    notice.classList.add("hidden");
+  }
   if (!v) {
-    stats.innerHTML = "";
     $("#deliveryName").textContent = "";
     return;
   }
@@ -201,6 +301,7 @@ function renderDeliveryVerify() {
 
 function render() {
   const p = state.project;
+  syncDeliveryVerify();   // 生效轴已变 ⇒ 作废旧核验结论并自动重核
   if (!p) {
     $("#workspace").classList.add("hidden");
     $("#importPanel").classList.remove("hidden");
@@ -323,8 +424,9 @@ $("#importForm").addEventListener("submit", async (ev) => {
   fd.append("subtitle", f.subtitle.files[0]);
   if (f.shots_file.files[0]) fd.append("shots_file", f.shots_file.files[0]);
   try {
-    state.project = await api("/api/projects", { method: "POST", body: fd });
-    state.deliveryVerify = null;
+    const p = await api("/api/projects", { method: "POST", body: fd });
+    resetDelivery();
+    state.project = p;
     toast("导入并分析完成");
     await loadProjects();
     render();
@@ -441,31 +543,22 @@ $("#gapList").addEventListener("click", async (ev) => {
 });
 
 // 交付字幕核验：上传回传稿，服务端保序最优对应后返回逐行结论。
-// 只读核验，失败（空稿/解析失败）仅弹错，不影响当前项目数据。
+// 只读核验，失败（空稿/解析失败）仅弹错并恢复旧结论，不影响当前项目数据。
 $("#deliveryVerifyForm").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   if (!state.project) return;
   const f = ev.target;
-  if (!f.delivery.files[0]) return;
-  const fd = new FormData();
-  fd.append("delivery", f.delivery.files[0]);
-  try {
-    state.deliveryVerify = await api(
-      `/api/projects/${state.project.id}/verify-delivery`,
-      { method: "POST", body: fd });
-    renderDeliveryVerify();
-    const s = state.deliveryVerify.summary;
-    toast(`核验完成：通过 ${s.pass} · 时间不符 ${s.time_mismatch} · ` +
-          `缺失 ${s.missing} · 新增 ${s.new} · 待确认 ${s.pending}`);
-  } catch (e) { toast(e.message, true); }
+  const file = f.delivery.files[0];
+  if (!file) return;
+  runDeliveryVerify(file);
 });
 
 $("#deleteProjectBtn").addEventListener("click", async () => {  if (!state.project) return;
   if (!confirm(`确定删除项目「${state.project.name}」？该操作不可恢复。`)) return;
   try {
     await api(`/api/projects/${state.project.id}`, { method: "DELETE" });
+    resetDelivery();
     state.project = null;
-    state.deliveryVerify = null;
     toast("项目已删除");
     await loadProjects();
     render();
@@ -476,15 +569,16 @@ $("#projectSelect").addEventListener("change", async (ev) => {
   const id = ev.target.value;
   if (!id) return;
   try {
-    state.project = await api(`/api/projects/${id}`);
-    state.deliveryVerify = null;
+    const p = await api(`/api/projects/${id}`);
+    resetDelivery();
+    state.project = p;
     render();
   } catch (e) { toast(e.message, true); }
 });
 
 $("#newProjectBtn").addEventListener("click", () => {
+  resetDelivery();
   state.project = null;
-  state.deliveryVerify = null;
   $("#projectSelect").value = "";
   render();
 });

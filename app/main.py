@@ -99,6 +99,32 @@ def _effective_report_times(rep) -> tuple[int, int]:
     return rep.start_ms, rep.end_ms
 
 
+def _effective_times(c: dict) -> tuple[int, int]:
+    """导出/核验时间轴上一条 cue 的生效时间：已采纳取采纳值；未采纳先取
+    提案，无提案取原值。独立 SRT 与 ZIP 内 SRT 共用同一有效时间轴。"""
+    s, e = c["adopted_start_ms"], c["adopted_end_ms"]
+    if s is None:
+        s, e = c["proposal_start_ms"], c["proposal_end_ms"]
+    if s is None:
+        s, e = c["start_ms"], c["end_ms"]
+    return s, e
+
+
+def _timeline_hash(analysis_cues: list[dict]) -> str:
+    """生效时间轴指纹：(text, 生效起点, 生效终点) 序列的 SHA-256。
+
+    项目详情与 verify-delivery 同源输出，前端据此把核验结论与生效轴绑定：
+    参数重算 / 采纳 / 撤销改变了生效轴 ⇒ 指纹变化 ⇒ 旧结论作废（用已选稿
+    按新轴重核）；相同参数重提交、修改失败或未影响生效轴的写入 ⇒ 指纹
+    不变 ⇒ 已展示的有效结论保留。"""
+    h = hashlib.sha256()
+    for c in analysis_cues:
+        s, e = _effective_times(c)
+        h.update(c["text"].encode("utf-8"))
+        h.update(f"\x00{s}\x00{e}\n".encode("ascii"))
+    return h.hexdigest()
+
+
 def _gap_review_payload(conn, pid: int, shots: list[Shot], analysis) -> dict:
     """镜头留白审阅：按与 SRT 导出相同的生效时间轴逐镜头计算未被字幕
     覆盖的半开区间，并叠加库中已保存的审阅结论。结论按
@@ -153,6 +179,7 @@ def _recompute_from(conn, pid: int, prow, cue_db_rows, shots, parsed) -> dict:
         rep.adopted = dbr["new_start_ms"] is not None
         rep.adopted_start_ms = dbr["new_start_ms"]
         rep.adopted_end_ms = dbr["new_end_ms"]
+    analysis_cues = [vars(c) for c in analysis.cues]
     return {
         "id": prow["id"],
         "name": prow["name"],
@@ -160,11 +187,12 @@ def _recompute_from(conn, pid: int, prow, cue_db_rows, shots, parsed) -> dict:
         "min_gap_ms": prow["min_gap_ms"],
         "tolerance_ms": prow["tolerance_ms"],
         "created_at": prow["created_at"],
+        "timeline_hash": _timeline_hash(analysis_cues),
         "shots": [{"ord": s.ord, "start_ms": s.start_ms,
                    "end_ms": s.end_ms} for s in shots],
         "cues": [_cue_row(r) for r in cue_db_rows],
         "analysis": {
-            "cues": [vars(c) for c in analysis.cues],
+            "cues": analysis_cues,
             "chains": analysis.chains,
             "intrinsic": analysis.intrinsic,
             "stats": analysis.stats,
@@ -422,17 +450,6 @@ def _build_srt(cues: list[dict], key_start="proposal_start_ms",
     return "\n".join(out)
 
 
-def _effective_times(c: dict) -> tuple[int, int]:
-    """导出时间轴上一条 cue 的生效时间：已采纳取采纳值；未采纳先取提案，
-    无提案取原值。独立 SRT 与 ZIP 内 SRT 共用同一有效时间轴。"""
-    s, e = c["adopted_start_ms"], c["adopted_end_ms"]
-    if s is None:
-        s, e = c["proposal_start_ms"], c["proposal_end_ms"]
-    if s is None:
-        s, e = c["start_ms"], c["end_ms"]
-    return s, e
-
-
 @app.get("/api/projects/{pid}/export")
 def export(pid: int, fmt: str = "json"):
     with db.get_conn() as conn:
@@ -524,7 +541,9 @@ async def verify_delivery(pid: int, delivery: UploadFile = File(...)):
     只读操作：复用 parse_subtitle 解析回传稿，生效时间轴与 SRT 导出共用
     同一规则（已采纳 → 提案 → 原值）；保序最优对应、等优歧义待确认的全部
     规则见 app.verification。不改动采纳、留白结论与任何导出。空稿或解析
-    失败返回 400，核验不落库。
+    失败返回 400，核验不落库。响应携带与项目详情同源的 timeline_hash
+    （生效轴指纹）：调用方据此识别结论对应的生效轴，生效轴变化后旧结论
+    不得再展示。
     """
     sub_bytes = await delivery.read()
     try:
@@ -556,6 +575,7 @@ async def verify_delivery(pid: int, delivery: UploadFile = File(...)):
     ]
     return {"project_id": data["id"], "project_name": data["name"],
             "delivery_name": delivery.filename or "",
+            "timeline_hash": data["timeline_hash"],
             **vfy.verify_delivery(refs, delivered)}
 
 

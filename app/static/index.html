@@ -107,12 +107,16 @@
         （已采纳 → 提案 → 原值）逐条对照。交付稿允许重编号、插删行、重复文案，
         按「保持顺序、同文案匹配最多、时间偏差之和最小」配对；存在等优配对且会
         改变某行结论时，相关行列为<strong>待确认</strong>，不自动判缺失/时间不符。
-        核验结果不落库，不影响采纳、留白结论与 JSON/SRT/ZIP 导出。</p>
+        结论与生效轴绑定：修改参数、采纳或撤销<strong>改变了生效时间轴</strong>后，
+        旧结论自动作废，并用已选择的回传稿按新生效轴重新核验（无需重新选择文件）；
+        参数未实际改变或修改失败时，已展示的结论保留。核验结果不落库，
+        不影响采纳、留白结论与 JSON/SRT/ZIP 导出。</p>
       <form id="deliveryVerifyForm" class="delivery-form">
         <input name="delivery" type="file" accept=".srt,.vtt,text/vtt" required>
         <button type="submit" class="primary">上传并核验</button>
         <span id="deliveryName" class="muted"></span>
       </form>
+      <div id="verifyNotice" class="notice hidden"></div>
       <div id="verifyStats" class="stats"></div>
       <div class="table-wrap">
         <table id="verifyTable">

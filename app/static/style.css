@@ -143,6 +143,11 @@ tr.row-proposed td { }
 /* 交付字幕核验 */
 .delivery-form { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 10px 0; }
 .delivery-form .muted { font-size: 12px; }
+.notice {
+  border: 1px solid var(--line); border-left: 3px solid var(--accent);
+  background: var(--panel-2); border-radius: 6px;
+  padding: 8px 12px; margin: 8px 0; font-size: 12px; color: var(--muted);
+}
 .verify-row td span.muted { display: block; margin-top: 2px; }
 .pill.vf-pass { background: rgba(62,207,142,.15); color: var(--good); }
 .pill.vf-time_mismatch { background: rgba(240,98,107,.14); color: var(--bad); }
