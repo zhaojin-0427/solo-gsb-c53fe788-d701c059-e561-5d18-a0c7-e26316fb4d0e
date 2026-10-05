@@ -8,6 +8,9 @@
   相关行列为待确认，不强判缺失 / 时间不符 / 新增；
 - 保序对应不按 cue_id / 行号、不按贪心就近配对；
 - 生效时间轴：已采纳 → 提案 → 原值；
+- timeline_hash 绑定：参数重算/采纳/撤销改变生效轴则指纹必变，未改变
+  （相同参数重提、仅调 CPS、采纳值即提案值）或修改失败则不变；核验响应
+  与项目详情携带同一指纹，供前端作废旧结论；
 - 空稿 / 解析失败 400；核验不改动采纳、留白结论与 JSON/SRT/ZIP 导出。
 """
 import asyncio
@@ -283,6 +286,97 @@ def test_e2e_empty_and_parse_errors():
     print("e2e empty / parse failure / 404 ok")
 
 
+def test_e2e_timeline_hash_binding():
+    """生效轴指纹 timeline_hash：核验结论与「项目 + 生效轴」绑定。
+
+    参数重算 / 采纳 / 撤销改变了生效轴 → hash 必变（前端据此作废旧结论）；
+    未改变生效轴（相同参数重提、仅调 CPS、采纳值即提案值）或修改失败 →
+    hash 不变（前端保留有效结论）。核验响应携带与详情一致的 hash。
+    场景即 README 用例：相接两条 0–1000 / 1000–2000，最小间隔 40ms 时
+    回传稿按 1040ms 提案核验通过；改为 100ms 后提案变为 1100ms。
+    """
+    srt = ("1\n00:00:00,000 --> 00:00:01,000\n甲\n\n"
+           "2\n00:00:01,000 --> 00:00:02,000\n乙\n")
+    proj = _create(srt=srt)  # min_gap=40 → 提案 0–1000 / 1040–2040
+    pid = proj["id"]
+    h1 = proj["timeline_hash"]
+    assert [c["proposal_start_ms"] for c in proj["analysis"]["cues"]] == [0, 1040]
+
+    # 回传稿按 1040 提案：全部通过；响应 hash / project_id 与详情一致
+    deliv = ("1\n00:00:00,000 --> 00:00:01,000\n甲\n\n"
+             "2\n00:00:01,040 --> 00:00:02,040\n乙\n")
+    v = _verify(pid, deliv)
+    assert v["summary"]["pass"] == 2
+    assert v["project_id"] == pid and v["timeline_hash"] == h1
+    assert set(v["summary"].keys()) == {"pass", "time_mismatch", "missing",
+                                        "new", "pending"}
+
+    # 最小间隔 40 → 100：提案变 1100，生效轴指纹必须变化；旧回传稿不再通过
+    proj = m.update_settings(pid, m.SettingsIn(
+        cps_limit=21.0, min_gap_ms=100, tolerance_ms=200))
+    h2 = proj["timeline_hash"]
+    assert h2 != h1
+    assert proj["analysis"]["cues"][1]["proposal_start_ms"] == 1100
+    v = _verify(pid, deliv)
+    assert v["timeline_hash"] == h2
+    assert v["summary"]["pass"] == 1 and v["summary"]["time_mismatch"] == 1
+    row = next(r for r in v["rows"] if r["kind"] == "match" and r["text"] == "乙")
+    # Δ = 交付 − 生效轴 = 1040 − 1100
+    assert row["delta_start_ms"] == -60 and row["delta_end_ms"] == -60
+
+    # 相同参数重复提交：生效轴未变 → hash 不变（前端保留结论）
+    proj = m.update_settings(pid, m.SettingsIn(
+        cps_limit=21.0, min_gap_ms=100, tolerance_ms=200))
+    assert proj["timeline_hash"] == h2
+    # 仅调 CPS 上限：不改变时间轴 → hash 不变
+    proj = m.update_settings(pid, m.SettingsIn(
+        cps_limit=10.0, min_gap_ms=100, tolerance_ms=200))
+    assert proj["timeline_hash"] == h2
+
+    # 非法参数被拒绝：修改失败 → hash 不变
+    try:
+        m.update_settings(pid, m.SettingsIn(
+            cps_limit=0, min_gap_ms=100, tolerance_ms=200))
+        raise AssertionError("非法参数应 400")
+    except HTTPException as exc:
+        assert exc.status_code == 400
+    assert m.get_project(pid)["timeline_hash"] == h2
+
+    # 采纳值即提案值：生效轴不变（未采纳本就回退提案）→ hash 不变
+    cues = proj["analysis"]["cues"]
+    proj = m.adopt(pid, m.AdoptIn(cue_uid=cues[1]["uid"],
+                                  new_start_ms=1100, new_end_ms=2100))
+    assert proj["timeline_hash"] == h2
+    # min_gap 100 → 30：提案变 1030，采纳 1100 仍合法 → 生效轴仍取采纳值
+    # 1100，与 h2 的生效位置相同 → hash 不变，旧结论依然有效
+    proj = m.update_settings(pid, m.SettingsIn(
+        cps_limit=10.0, min_gap_ms=30, tolerance_ms=200))
+    assert proj["timeline_hash"] == h2
+    c2 = proj["analysis"]["cues"][1]
+    assert c2["adopted"] and c2["adopted_start_ms"] == 1100
+    assert c2["proposal_start_ms"] == 1030
+    # 撤销采纳：生效轴从采纳值 1100 回落提案 1030 → hash 必变
+    proj = m.revert_adoption(pid, cues[1]["uid"])
+    h3 = proj["timeline_hash"]
+    assert h3 != h2
+    v = _verify(pid, deliv)
+    assert v["timeline_hash"] == h3 and v["summary"]["time_mismatch"] == 1
+    # 重新采纳到当前提案 1030（采纳值即提案值，hash 不变），随后收紧
+    # min_gap 使采纳被重算撤销：1030 与新提案 1050 都改变生效轴 → hash 再变
+    proj = m.adopt(pid, m.AdoptIn(cue_uid=cues[1]["uid"],
+                                  new_start_ms=1030, new_end_ms=2030))
+    assert proj["timeline_hash"] == h3
+    proj = m.update_settings(pid, m.SettingsIn(
+        cps_limit=10.0, min_gap_ms=50, tolerance_ms=200))
+    c2 = proj["analysis"]["cues"][1]
+    assert not c2["adopted"] and c2["proposal_start_ms"] == 1050
+    h4 = proj["timeline_hash"]
+    assert h4 not in (h2, h3)
+    v = _verify(pid, deliv)
+    assert v["timeline_hash"] == h4
+    print("e2e timeline_hash binding (stale invalidation) ok")
+
+
 def test_e2e_verification_changes_nothing():
     proj = _create()
     pid = proj["id"]
@@ -339,6 +433,7 @@ def main():
     test_e2e_mismatch_missing_new()
     test_e2e_effective_timeline_adopted_first(pid)
     test_e2e_empty_and_parse_errors()
+    test_e2e_timeline_hash_binding()
     test_e2e_verification_changes_nothing()
     print("delivery verify regression ok")
 

@@ -99,6 +99,20 @@ def _effective_report_times(rep) -> tuple[int, int]:
     return rep.start_ms, rep.end_ms
 
 
+def _timeline_hash(analysis) -> str:
+    """生效时间轴指纹：覆盖核验输入 refs 的全部字段（ord / cue_id / 可见
+    文本 / 生效起止毫秒）。参数重算、采纳、撤销只要改变了生效轴，哈希必变；
+    不改变生效轴的操作（仅调 CPS 上限、相同参数重提、修改失败回滚）哈希
+    保持不变。项目详情与 verify-delivery 响应携带同一指纹，前端据此判定
+    已展示的核验结论是否过期。"""
+    h = hashlib.sha256()
+    for rep in analysis.cues:
+        s, e = _effective_report_times(rep)
+        h.update(f"{rep.ord}\x1f{rep.cue_id}\x1f{rep.text}\x1f{s}\x1f{e}\x1e"
+                 .encode("utf-8"))
+    return h.hexdigest()
+
+
 def _gap_review_payload(conn, pid: int, shots: list[Shot], analysis) -> dict:
     """镜头留白审阅：按与 SRT 导出相同的生效时间轴逐镜头计算未被字幕
     覆盖的半开区间，并叠加库中已保存的审阅结论。结论按
@@ -160,6 +174,7 @@ def _recompute_from(conn, pid: int, prow, cue_db_rows, shots, parsed) -> dict:
         "min_gap_ms": prow["min_gap_ms"],
         "tolerance_ms": prow["tolerance_ms"],
         "created_at": prow["created_at"],
+        "timeline_hash": _timeline_hash(analysis),
         "shots": [{"ord": s.ord, "start_ms": s.start_ms,
                    "end_ms": s.end_ms} for s in shots],
         "cues": [_cue_row(r) for r in cue_db_rows],
@@ -524,7 +539,9 @@ async def verify_delivery(pid: int, delivery: UploadFile = File(...)):
     只读操作：复用 parse_subtitle 解析回传稿，生效时间轴与 SRT 导出共用
     同一规则（已采纳 → 提案 → 原值）；保序最优对应、等优歧义待确认的全部
     规则见 app.verification。不改动采纳、留白结论与任何导出。空稿或解析
-    失败返回 400，核验不落库。
+    失败返回 400，核验不落库。响应携带 project_id 与 timeline_hash
+    （与项目详情同源的生效轴指纹），调用方据此把结论绑定到「该项目、
+    该生效轴」：生效轴变化后旧结论即过期，不得继续展示。
     """
     sub_bytes = await delivery.read()
     try:
@@ -556,6 +573,7 @@ async def verify_delivery(pid: int, delivery: UploadFile = File(...)):
     ]
     return {"project_id": data["id"], "project_name": data["name"],
             "delivery_name": delivery.filename or "",
+            "timeline_hash": data["timeline_hash"],
             **vfy.verify_delivery(refs, delivered)}
 
 
